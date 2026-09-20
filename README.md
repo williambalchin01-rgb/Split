@@ -6,7 +6,11 @@ your iPhone Home Screen with no account and no server.
 
 ## What it does
 
+- **One to one** — a running tab with a single person, for the constant
+  back-and-forth that does not deserve a group.
 - **Groups** for a trip, a flat or a one-off, each with its own currency (GBP by default).
+- **One list of people** shared by both, so the Sam on your one-to-one tab is the same
+  Sam in the Lisbon group, and what he owes you adds up across the lot.
 - **Expenses** — who paid, how much, when, what for.
 - **Three ways to split**: equally, by exact amounts, or by shares (1:1:2 and so on).
   Odd pennies are handed out by largest remainder, so the parts always add up to the total.
@@ -17,6 +21,18 @@ your iPhone Home Screen with no account and no server.
 - **Backup / restore** as a JSON file.
 
 Money is stored in pence as whole numbers throughout, so nothing drifts by a penny.
+
+### A note on the two kinds of total
+
+Every expense creates a debt from each participant to whoever paid, so *what Sam owes you*
+is exact even inside a big group. That pairwise figure is what the **People** rows show,
+added up across every ledger you share.
+
+A person's **balance** inside a group is a different number: it is what they owe *everyone*
+there. In a group where Ada owes you £200 and Sam £20, her balance reads £220 while your
+one-to-one total with her reads £200. Both are right; they answer different questions. The
+*simplest way to settle* may also route a payment to someone other than the person owed,
+which is the point of it — fewer transfers, same result.
 
 ## Installing on an iPhone
 
@@ -44,7 +60,8 @@ python3 -m http.server 8000
 
 ## Where the data lives
 
-In `localStorage` on the device, under the key `split.v1`. It is never uploaded anywhere.
+In `localStorage` on the device, under the key `split` (data written by the first version,
+under `split.v1`, is migrated automatically the first time it is opened). It is never uploaded anywhere.
 That also means it is per-device and per-browser: clearing Safari's website data wipes it,
 so take a backup from **••• → Export a backup** before doing anything drastic. Sharing a
 group between phones is not supported — that needs a server.

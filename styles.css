@@ -135,6 +135,13 @@ main{flex:1;padding:12px 16px calc(130px + var(--safe-bottom))}
 .split-line input{width:92px;text-align:right;background:var(--bg-elev-2);border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-variant-numeric:tabular-nums}
 .hint{font-size:13px;color:var(--text-dim);padding:10px 14px}
 .hint.bad{color:var(--warn)}
+.bad{color:var(--warn)}
+.code{
+  font:700 26px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;
+  letter-spacing:.08em;text-align:center;padding:10px 0 4px;
+  color:var(--accent);user-select:all;-webkit-user-select:all;
+}
+.sync-dot{width:8px;height:8px;border-radius:50%;flex:none;display:inline-block;margin-right:6px}
 
 /* ---------- buttons ---------- */
 .btn{

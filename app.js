@@ -19,8 +19,37 @@ const CURRENCIES = [
 ];
 const CATEGORIES = ['General', 'Food & drink', 'Groceries', 'Travel', 'Accommodation', 'Tickets', 'Shopping', 'Utilities'];
 
-const blank = () => ({ version: 2, me: null, people: [], ledgers: [] });
+const blank = () => ({ version: 3, meIds: [], people: [], ledgers: [], sync: {}, localSeq: 0 });
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const now = () => Date.now();
+
+/* This device's own id. Two devices editing the same record settle it by
+   timestamp, and by device id when the timestamps land on the same
+   millisecond, so both sides reach the same answer without talking. */
+const DEVICE = (() => {
+  try {
+    let id = localStorage.getItem('split.device');
+    if (!id) { id = uid(); localStorage.setItem('split.device', id); }
+    return id;
+  } catch { return uid(); }
+})();
+
+/* Records are never removed, only marked dead, or a delete on one phone
+   would look like a missing record on the other and come straight back. */
+/* localSeq counts edits made on this phone and nothing else. Deciding what
+   still needs pushing by timestamp looked fine until a record arrived from
+   a phone whose clock ran fast: the high-water mark jumped past our own
+   clock and every later edit here was quietly never sent. A counter we
+   alone control cannot be dragged forward by anyone else. It is stripped
+   off before a record goes over the wire, so it never travels. */
+const stamp = record => {
+  record.updatedAt = now();
+  record.device = DEVICE;
+  record.localSeq = (db.localSeq = (db.localSeq || 0) + 1);
+  return record;
+};
+const alive = record => record && !record.deleted;
+const kill = record => { record.deleted = true; return stamp(record); };
 
 let db = load();
 
@@ -29,7 +58,7 @@ function load() {
     const raw = localStorage.getItem(KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (parsed && Array.isArray(parsed.ledgers)) return parsed;
+      if (parsed && Array.isArray(parsed.ledgers)) return upgrade(parsed);
     }
     const legacy = localStorage.getItem(LEGACY_KEY);
     if (legacy) {
@@ -61,7 +90,7 @@ function migrate(old) {
   old.groups.forEach(g => {
     const map = {};
     (g.members || []).forEach(m => { map[m.id] = ensure(m.name); });
-    if (g.meId && map[g.meId] && !out.me) out.me = map[g.meId];
+    if (g.meId && map[g.meId] && !out.meIds.length) out.meIds.push(map[g.meId]);
     const remap = obj => Object.fromEntries(
       Object.entries(obj || {}).map(([k, v]) => [map[k] || k, v]));
     out.ledgers.push({
@@ -78,8 +107,44 @@ function migrate(old) {
       created: g.created,
     });
   });
-  if (!out.me && out.people.length) out.me = out.people[0].id;
-  return out;
+  if (!out.meIds.length && out.people.length) out.meIds.push(out.people[0].id);
+  /* blank() is already the current shape, so stamp the records by hand
+     rather than leaning on upgrade(), which would see v3 and bow out. */
+  return upgrade({ ...out, version: 2, meIds: out.meIds });
+}
+
+/* v2 kept a single `me` and no timestamps. Sync needs both: an id list,
+   because a shared ledger brings its own copy of me, and a stamp on every
+   record so two phones can agree on which edit came last. */
+function upgrade(data) {
+  if (data.version === 3 && Array.isArray(data.meIds) && data.meIds.length !== undefined
+      && data.ledgers.every(l => typeof l.updatedAt === 'number')) {
+    data.sync = data.sync || {};
+    return data;
+  }
+  data.version = 3;
+  data.sync = data.sync || {};
+  data.meIds = Array.isArray(data.meIds) ? data.meIds : (data.me ? [data.me] : []);
+  delete data.me;
+
+  /* Back-date the stamps so a record that has never been edited since the
+     upgrade cannot outrank a genuine edit made on the other phone. */
+  const base = 1;
+  let seq = data.localSeq || 0;
+  const touch = record => {
+    if (typeof record.updatedAt !== 'number') record.updatedAt = base;
+    if (!record.device) record.device = '';
+    if (typeof record.localSeq !== 'number') record.localSeq = ++seq;
+    return record;
+  };
+  (data.people || []).forEach(touch);
+  (data.ledgers || []).forEach(l => {
+    touch(l);
+    l.expenses = (l.expenses || []).map(touch);
+    l.settlements = (l.settlements || []).map(touch);
+  });
+  data.localSeq = seq;
+  return data;
 }
 
 function save() {
@@ -88,6 +153,7 @@ function save() {
   } catch (err) {
     toast('Could not save — storage is full or blocked');
   }
+  if (window.SplitSync) window.SplitSync.localChanged();
 }
 
 /* ------------------------------------------------------------------ money */
@@ -152,7 +218,7 @@ function balances(ledger) {
   const net = {};
   ledger.members.forEach(id => { net[id] = 0; });
 
-  ledger.expenses.forEach(e => {
+  expensesOf(ledger).forEach(e => {
     if (net[e.paidBy] === undefined) return;
     net[e.paidBy] += e.amount;
     Object.entries(sharesOf(e, ledger)).forEach(([id, amt]) => {
@@ -160,7 +226,7 @@ function balances(ledger) {
     });
   });
 
-  (ledger.settlements || []).forEach(s => {
+  settlementsOf(ledger).forEach(s => {
     if (net[s.from] !== undefined) net[s.from] += s.amount;
     if (net[s.to] !== undefined) net[s.to] -= s.amount;
   });
@@ -173,13 +239,13 @@ function balances(ledger) {
    and summing it over everyone gives back that person's balance. */
 function pairNet(ledger, a, b) {
   let n = 0;
-  ledger.expenses.forEach(e => {
+  expensesOf(ledger).forEach(e => {
     if (e.paidBy !== a && e.paidBy !== b) return;
     const shares = sharesOf(e, ledger);
     if (e.paidBy === a) n += shares[b] || 0;
     else n -= shares[a] || 0;
   });
-  (ledger.settlements || []).forEach(s => {
+  settlementsOf(ledger).forEach(s => {
     if (s.from === b && s.to === a) n -= s.amount;
     else if (s.from === a && s.to === b) n += s.amount;
   });
@@ -244,14 +310,30 @@ const totalsSign = totals => {
 };
 
 /* ------------------------------------------------------------------ model */
-const ledgerById = id => db.ledgers.find(l => l.id === id);
-const personById = id => db.people.find(p => p.id === id);
-const nameOf = id => (id === db.me ? 'You' : (personById(id)?.name || 'Someone'));
-const realName = id => personById(id)?.name || 'Someone';
-const otherIn = ledger => ledger.members.find(id => id !== db.me) || ledger.members[0];
+/* A shared ledger arrives with its own person records, so the copy of me
+   inside someone else's group is a different id from my own. Rather than
+   rewriting ids on the way in, every id that means me is kept in a list. */
+const myId = () => db.meIds[0] || null;
+const isMe = id => id != null && db.meIds.includes(id);
+const claimMe = id => { if (id && !db.meIds.includes(id)) db.meIds.push(id); };
 
-const directLedgers = () => db.ledgers.filter(l => l.kind === 'direct');
-const groupLedgers = () => db.ledgers.filter(l => l.kind !== 'direct');
+const ledgerById = id => db.ledgers.find(l => l.id === id && alive(l));
+const personById = id => db.people.find(p => p.id === id);
+const nameOf = id => (isMe(id) ? 'You' : (personById(id)?.name || 'Someone'));
+const realName = id => personById(id)?.name || 'Someone';
+const otherIn = ledger => ledger.members.find(id => !isMe(id)) || ledger.members[0];
+
+const myMemberIn = ledger => ledger.members.find(isMe) || null;
+const inLedger = ledger => ledger.members.some(isMe);
+
+const liveLedgers = () => db.ledgers.filter(alive);
+const expensesOf = ledger => ledger.expenses.filter(alive);
+const settlementsOf = ledger => (ledger.settlements || []).filter(alive);
+
+const directLedgers = () => liveLedgers().filter(l => l.kind === 'direct');
+const groupLedgers = () => liveLedgers().filter(l => l.kind !== 'direct');
+
+const totalSpent = ledger => expensesOf(ledger).reduce((a, e) => a + e.amount, 0);
 
 function ledgerTitle(ledger) {
   return ledger.kind === 'direct' ? realName(otherIn(ledger)) : ledger.name;
@@ -261,28 +343,38 @@ function ledgerTitle(ledger) {
 function ensurePerson(name) {
   const clean = String(name || '').trim();
   if (!clean) return null;
-  const found = db.people.find(p => p.name.toLowerCase() === clean.toLowerCase());
+  const found = db.people.find(p => alive(p) && p.name.toLowerCase() === clean.toLowerCase());
   if (found) return found.id;
-  const person = { id: uid(), name: clean };
+  const person = stamp({ id: uid(), name: clean });
   db.people.push(person);
   return person.id;
 }
 
+function renamePerson(id, name) {
+  const person = personById(id);
+  if (!person || !String(name || '').trim()) return;
+  person.name = String(name).trim();
+  stamp(person);
+}
+
 function ensureMe(name) {
-  if (db.me && personById(db.me)) {
-    if (name) personById(db.me).name = String(name).trim() || personById(db.me).name;
-    return db.me;
+  const mine = myId();
+  if (mine && personById(mine)) {
+    if (name) renamePerson(mine, name);
+    return mine;
   }
-  db.me = ensurePerson(name || 'Me');
-  return db.me;
+  const id = ensurePerson(name || 'Me');
+  claimMe(id);
+  return id;
 }
 
 /* Everything owed between me and one person, across every shared ledger. */
 function overallWith(personId) {
   const totals = {};
-  db.ledgers.forEach(l => {
-    if (!l.members.includes(personId) || !l.members.includes(db.me)) return;
-    const amt = pairNet(l, db.me, personId);
+  liveLedgers().forEach(l => {
+    const mine = myMemberIn(l);
+    if (!mine || !l.members.includes(personId) || isMe(personId)) return;
+    const amt = pairNet(l, mine, personId);
     if (amt) addTo(totals, l.currency, amt);
   });
   return totals;
@@ -291,9 +383,10 @@ function overallWith(personId) {
 /* My position across the lot. */
 function overallMine() {
   const totals = {};
-  db.ledgers.forEach(l => {
-    if (!l.members.includes(db.me)) return;
-    const amt = balances(l)[db.me] || 0;
+  liveLedgers().forEach(l => {
+    const mine = myMemberIn(l);
+    if (!mine) return;
+    const amt = balances(l)[mine] || 0;
     if (amt) addTo(totals, l.currency, amt);
   });
   return totals;
@@ -362,6 +455,13 @@ function render() {
   else app.innerHTML = homeView();
 
   window.scrollTo(0, 0);
+
+  if (section === 'join') {
+    const code = id || '';
+    goSameStep('/');
+    app.innerHTML = homeView();
+    joinSheet(code);
+  }
 }
 
 function homeView() {
@@ -385,27 +485,27 @@ function homeView() {
        included, so the subtitle has to say when it is not just this tab. */
     const totals = overallWith(other);
     const s = totalsSign(totals);
-    const alsoIn = db.ledgers.filter(x =>
-      x.id !== l.id && x.members.includes(other) && x.members.includes(db.me)).length;
+    const alsoIn = liveLedgers().filter(x =>
+      x.id !== l.id && x.members.includes(other) && inLedger(x)).length;
     return row({
       action: 'open-ledger', id: l.id,
       icon: avatar(other),
       title: realName(other),
       meta: alsoIn
         ? `This tab and ${alsoIn} shared group${alsoIn === 1 ? '' : 's'}`
-        : `Just the two of you · ${l.expenses.length} ${l.expenses.length === 1 ? 'entry' : 'entries'}`,
+        : `Just the two of you · ${expensesOf(l).length} ${expensesOf(l).length === 1 ? 'entry' : 'entries'}`,
       ...totalsCell(totals, { owed: 'owes you', owe: 'you owe', level: 'settled up' }),
       cls: s === 1 ? 'pos' : s === -1 ? 'neg' : s === 2 ? '' : 'zero',
     });
   }).join('');
 
   const groupRows = groups.map(l => {
-    const amt = balances(l)[db.me] || 0;
+    const amt = balances(l)[myMemberIn(l)] || 0;
     return row({
       action: 'open-ledger', id: l.id,
       icon: badge(initials(l.name), colourFor(l.id)),
       title: l.name,
-      meta: `${l.members.length} people · ${money(l.expenses.reduce((a, e) => a + e.amount, 0), l.currency)} spent`,
+      meta: `${l.members.length} people · ${money(totalSpent(l), l.currency)} spent`,
       label: amt > 0 ? 'you are owed' : amt < 0 ? 'you owe' : '',
       value: amt === 0 ? 'settled up' : money(Math.abs(amt), l.currency),
       cls: amt > 0 ? 'pos' : amt < 0 ? 'neg' : 'zero',
@@ -489,8 +589,8 @@ function ledgerView(l, tab) {
 
 function expensesTab(l) {
   const items = [
-    ...l.expenses.map(e => ({ kind: 'expense', date: e.date, data: e })),
-    ...(l.settlements || []).map(s => ({ kind: 'settlement', date: s.date, data: s })),
+    ...expensesOf(l).map(e => ({ kind: 'expense', date: e.date, data: e })),
+    ...settlementsOf(l).map(s => ({ kind: 'settlement', date: s.date, data: s })),
   ].sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.data.id > a.data.id ? 1 : -1));
 
   if (!items.length) {
@@ -501,7 +601,7 @@ function expensesTab(l) {
     </div>`;
   }
 
-  const total = l.expenses.reduce((a, e) => a + e.amount, 0);
+  const total = totalSpent(l);
   const rows = items.map(item => {
     if (item.kind === 'settlement') {
       const s = item.data;
@@ -517,8 +617,9 @@ function expensesTab(l) {
         </button>`;
     }
     const e = item.data;
-    const share = sharesOf(e, l)[db.me] || 0;
-    const mine = (e.paidBy === db.me ? e.amount : 0) - share;
+    const mine = myMemberIn(l);
+    const share = mine ? (sharesOf(e, l)[mine] || 0) : 0;
+    const lent = (e.paidBy === mine ? e.amount : 0) - share;
     return `
       <button class="row" data-action="edit-expense" data-id="${l.id}" data-eid="${e.id}">
         ${avatar(e.paidBy)}
@@ -527,9 +628,9 @@ function expensesTab(l) {
           <span class="meta">${esc(nameOf(e.paidBy))} paid ${money(e.amount, l.currency)} · ${esc(formatDate(e.date))}</span>
         </span>
         ${amountCell(
-          mine > 0 ? 'you lent' : mine < 0 ? 'you owe' : '',
-          mine === 0 ? 'not involved' : money(Math.abs(mine), l.currency),
-          mine > 0 ? 'pos' : mine < 0 ? 'neg' : 'zero')}
+          lent > 0 ? 'you lent' : lent < 0 ? 'you owe' : '',
+          lent === 0 ? 'not involved' : money(Math.abs(lent), l.currency),
+          lent > 0 ? 'pos' : lent < 0 ? 'neg' : 'zero')}
         <span class="chev">›</span>
       </button>`;
   }).join('');
@@ -543,7 +644,7 @@ function balancesTab(l) {
   const net = balances(l);
   const rows = l.members.map(id => {
     const amt = net[id] || 0;
-    const me = id === db.me;
+    const me = isMe(id);
     const phrase = amt > 0 ? (me ? 'You are owed' : `${realName(id)} is owed`)
       : amt < 0 ? (me ? 'You owe' : `${realName(id)} owes`)
       : (me ? 'You are settled up' : `${realName(id)} is settled up`);
@@ -586,12 +687,12 @@ function balancesTab(l) {
 function elsewhereCard(l) {
   if (l.kind !== 'direct') return '';
   const other = otherIn(l);
-  const shared = db.ledgers.filter(x =>
-    x.id !== l.id && x.members.includes(other) && x.members.includes(db.me));
+  const shared = liveLedgers().filter(x =>
+    x.id !== l.id && x.members.includes(other) && inLedger(x));
   if (!shared.length) return '';
 
   const rows = shared.map(x => {
-    const amt = pairNet(x, db.me, other);
+    const amt = pairNet(x, myMemberIn(x), other);
     return `
       <button class="row" data-action="open-ledger" data-id="${x.id}">
         ${badge(initials(ledgerTitle(x)), colourFor(x.id))}
@@ -616,22 +717,47 @@ function elsewhereCard(l) {
     }))}. Debts in different groups are kept apart until someone actually pays.</p>`;
 }
 
+function syncCard() {
+  const shared = liveLedgers().filter(l => db.sync[l.id]);
+  if (!syncOn()) {
+    return `<div class="card"><div class="hint">
+      <strong>Syncing is off.</strong> Everything lives on this phone only.
+      To share a group with someone, put a Supabase URL and anon key into
+      <strong>config.js</strong> and reload — see the README.
+    </div></div>`;
+  }
+  const status = window.SplitSync.state;
+  const colour = status.status === 'error' ? 'var(--danger)'
+    : status.status === 'syncing' ? 'var(--warn)' : 'var(--accent)';
+  const when = status.lastSync
+    ? new Date(status.lastSync).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
+    : 'not yet';
+  return `<div class="card"><div class="hint">
+    <span class="sync-dot" style="background:${colour}"></span>
+    ${shared.length
+      ? `Syncing ${shared.length} shared ${shared.length === 1 ? 'ledger' : 'ledgers'} · last checked ${esc(when)}`
+      : 'Ready to sync. Nothing is shared yet — open a group and tap ••• to make a join code.'}
+    ${status.status === 'error' ? `<br><span class="bad">${esc(status.error)}</span>` : ''}
+  </div></div>`;
+}
+
 function settingsView() {
-  const entries = db.ledgers.reduce((a, l) => a + l.expenses.length, 0);
-  const myName = db.me ? realName(db.me) : '';
+  const entries = liveLedgers().reduce((a, l) => a + expensesOf(l).length, 0);
+  const myName = myId() ? realName(myId()) : '';
   return `
     <header class="topbar">
       <button class="icon-btn plain" data-action="back">‹ Back</button>
       <h1>Settings</h1>
     </header>
     <main>
-      ${db.me ? `<div class="card">
+      ${myId() ? `<div class="card">
         <div class="field">
           <label for="my-name">Your name</label>
           <input id="my-name" value="${esc(myName)}" autocomplete="off">
         </div>
         <div class="field"><button class="btn small" data-action="save-my-name">Save name</button></div>
       </div>` : ''}
+      ${syncCard()}
       <div class="card"><div class="hint">${directLedgers().length} ${directLedgers().length === 1 ? 'person' : 'people'}, ${groupLedgers().length} group${groupLedgers().length === 1 ? '' : 's'} and ${entries} expense${entries === 1 ? '' : 's'}, stored on this device only. Nothing is uploaded anywhere.</div></div>
       <div class="btn-stack">
         <button class="btn secondary" data-action="export">Export a backup</button>
@@ -666,7 +792,7 @@ const currencyOptions = selected => CURRENCIES.map(c =>
   `<option value="${c.code}" ${c.code === selected ? 'selected' : ''}>${c.code} (${c.symbol.trim()})</option>`).join('');
 
 /* Shown once, the first time anything is created. */
-const myNameField = () => db.me ? '' : `
+const myNameField = () => myId() ? '' : `
   <div class="field">
     <label for="my-name-new">Your name</label>
     <input id="my-name-new" placeholder="Your name" autocomplete="off">
@@ -674,7 +800,7 @@ const myNameField = () => db.me ? '' : `
 
 const peopleDatalist = () => `
   <datalist id="known-people">
-    ${db.people.filter(p => p.id !== db.me).map(p => `<option value="${esc(p.name)}"></option>`).join('')}
+    ${db.people.filter(p => alive(p) && !isMe(p.id)).map(p => `<option value="${esc(p.name)}"></option>`).join('')}
   </datalist>`;
 
 function chooserSheet() {
@@ -683,8 +809,9 @@ function chooserSheet() {
     <div class="btn-stack" style="margin-top:4px">
       <button class="btn" data-action="new-person">One person</button>
       <button class="btn secondary" data-action="new-group">A group</button>
+      <button class="btn secondary" data-action="join-prompt">Join with a code</button>
     </div>
-    <p class="hint">A person is a running tab between the two of you. A group is for three or more sharing the same trip, flat or night out.</p>`);
+    <p class="hint">A person is a running tab between the two of you. A group is for three or more sharing the same trip, flat or night out. A code is how you get into one someone else has already made.</p>`);
 }
 
 /* ------------------------------------------------------------- person form */
@@ -714,7 +841,7 @@ function savePerson() {
   if (!theirName) return toast('Give them a name');
 
   const myName = document.getElementById('my-name-new')?.value.trim();
-  if (!db.me && !myName) return toast('Add your own name too');
+  if (!myId() && !myName) return toast('Add your own name too');
   const me = ensureMe(myName);
 
   const them = ensurePerson(theirName);
@@ -723,11 +850,11 @@ function savePerson() {
   const existing = directLedgers().find(l => l.members.includes(them));
   if (existing) { closeSheet(); go(`/l/${existing.id}`); return toast('You already have a tab with them'); }
 
-  const ledger = {
+  const ledger = stamp({
     id: uid(), kind: 'direct', name: '',
     currency: document.getElementById('p-cur').value,
     members: [me, them], expenses: [], settlements: [], created: todayISO(),
-  };
+  });
   db.ledgers.unshift(ledger);
   save();
   closeSheet();
@@ -738,7 +865,7 @@ function savePerson() {
 /* ------------------------------------------------------------- group form */
 function groupSheet(existing) {
   const l = existing || { name: '', currency: 'GBP', members: [] };
-  const others = l.members.filter(id => id !== db.me);
+  const others = l.members.filter(id => !isMe(id));
   const fields = others.length ? others : [null, null];
 
   openSheet(`
@@ -747,7 +874,7 @@ function groupSheet(existing) {
       ${myNameField()}
       <div class="field">
         <label for="g-name">Group name</label>
-        <input id="g-name" ${db.me ? 'data-autofocus="yes"' : ''} placeholder="Lisbon trip" value="${esc(l.name)}" autocomplete="off">
+        <input id="g-name" ${myId() ? 'data-autofocus="yes"' : ''} placeholder="Lisbon trip" value="${esc(l.name)}" autocomplete="off">
       </div>
       <div class="field">
         <label for="g-cur">Currency</label>
@@ -763,6 +890,7 @@ function groupSheet(existing) {
     <div class="btn-stack">
       <button class="btn secondary" data-action="add-member-field">+ Add another person</button>
       <button class="btn" data-action="save-group" data-id="${existing ? existing.id : ''}">${existing ? 'Save changes' : 'Create group'}</button>
+      ${existing ? `<button class="btn secondary" data-action="share-sheet" data-id="${existing.id}">${sharingLabel(existing)}</button>` : ''}
       ${existing ? `<button class="btn danger" data-action="delete-ledger" data-id="${existing.id}">Delete group</button>` : ''}
     </div>
     <p class="hint">You are in it automatically. Clear a name to drop that person — anyone already on an expense stays. Renaming someone renames them everywhere.</p>`);
@@ -781,7 +909,7 @@ function saveGroup(id) {
   if (!name) return toast('Give the group a name');
 
   const myName = document.getElementById('my-name-new')?.value.trim();
-  if (!db.me && !myName) return toast('Add your own name too');
+  if (!myId() && !myName) return toast('Add your own name too');
   const me = ensureMe(myName);
 
   const currency = document.getElementById('g-cur').value;
@@ -794,8 +922,8 @@ function saveGroup(id) {
   typed.forEach(m => {
     /* An existing member keeps their identity, so renaming here renames
        them everywhere rather than creating a stranger with a new name. */
-    let pid = m.pid && personById(m.pid) ? m.pid : ensurePerson(m.name);
-    if (m.pid && personById(m.pid)) personById(m.pid).name = m.name;
+    const pid = m.pid && personById(m.pid) ? m.pid : ensurePerson(m.name);
+    if (m.pid && personById(m.pid)) renamePerson(m.pid, m.name);
     if (pid && !members.includes(pid)) members.push(pid);
   });
 
@@ -804,18 +932,19 @@ function saveGroup(id) {
   if (id) {
     const l = ledgerById(id);
     const used = new Set();
-    l.expenses.forEach(e => { used.add(e.paidBy); (e.participants || []).forEach(p => used.add(p)); });
-    (l.settlements || []).forEach(s => { used.add(s.from); used.add(s.to); });
+    expensesOf(l).forEach(e => { used.add(e.paidBy); (e.participants || []).forEach(p => used.add(p)); });
+    settlementsOf(l).forEach(s => { used.add(s.from); used.add(s.to); });
     const stuck = l.members.filter(pid => !members.includes(pid) && used.has(pid));
     l.members = [...members, ...stuck];
     l.name = name;
     l.currency = currency;
+    stamp(l);
     if (stuck.length) toast(`${stuck.map(realName).join(', ')} kept — still on an expense`);
   } else {
-    db.ledgers.unshift({
+    db.ledgers.unshift(stamp({
       id: uid(), kind: 'group', name, currency, members,
       expenses: [], settlements: [], created: todayISO(),
-    });
+    }));
   }
   save();
   closeSheet();
@@ -825,7 +954,7 @@ function saveGroup(id) {
 /* ----------------------------------------------------------- expense form */
 function expenseSheet(l, existing) {
   const e = existing || {
-    id: '', description: '', amount: 0, paidBy: db.me,
+    id: '', description: '', amount: 0, paidBy: myMemberIn(l) || l.members[0],
     mode: 'equal', participants: [...l.members], weights: {},
     date: todayISO(), category: 'General',
   };
@@ -1027,18 +1156,14 @@ function saveExpense(lid, eid) {
     }
   }
 
-  const record = {
-    id: eid || uid(),
+  const record = stamp({
+    id: eid || uid(), ledgerId: l.id,
     description: description || 'Expense',
     amount, paidBy, date, category, mode, participants, weights,
-  };
+  });
 
-  if (eid) {
-    const i = l.expenses.findIndex(x => x.id === eid);
-    if (i >= 0) l.expenses[i] = record; else l.expenses.push(record);
-  } else {
-    l.expenses.push(record);
-  }
+  const i = eid ? l.expenses.findIndex(x => x.id === eid) : -1;
+  if (i >= 0) l.expenses[i] = record; else l.expenses.push(record);
   save();
   closeSheet();
   render();
@@ -1048,7 +1173,9 @@ function saveExpense(lid, eid) {
 /* -------------------------------------------------------- settlement form */
 function paymentSheet(l, preset, existing) {
   const s = existing || preset || {
-    from: db.me, to: l.members.find(id => id !== db.me), amount: 0, date: todayISO(),
+    from: myMemberIn(l) || l.members[0],
+    to: l.members.find(id => !isMe(id)) || l.members[1],
+    amount: 0, date: todayISO(),
   };
   const opts = who => l.members.map(id =>
     `<option value="${id}" ${id === who ? 'selected' : ''}>${esc(nameOf(id))}</option>`).join('');
@@ -1094,13 +1221,9 @@ function savePayment(lid, sid) {
   if (!amount || amount <= 0) return toast('Enter an amount above zero');
 
   l.settlements = l.settlements || [];
-  const record = { id: sid || uid(), from, to, amount, date };
-  if (sid) {
-    const i = l.settlements.findIndex(x => x.id === sid);
-    if (i >= 0) l.settlements[i] = record; else l.settlements.push(record);
-  } else {
-    l.settlements.push(record);
-  }
+  const record = stamp({ id: sid || uid(), ledgerId: l.id, from, to, amount, date });
+  const i = sid ? l.settlements.findIndex(x => x.id === sid) : -1;
+  if (i >= 0) l.settlements[i] = record; else l.settlements.push(record);
   save();
   closeSheet();
   render();
@@ -1111,7 +1234,7 @@ function savePayment(lid, sid) {
 function summaryText(l) {
   const net = balances(l);
   const lines = [
-    `${ledgerTitle(l)} — ${money(l.expenses.reduce((a, e) => a + e.amount, 0), l.currency)} spent`, '',
+    `${ledgerTitle(l)} — ${money(totalSpent(l), l.currency)} spent`, '',
   ];
   l.members.forEach(id => {
     const amt = net[id] || 0;
@@ -1205,17 +1328,20 @@ document.addEventListener('click', ev => {
     case 'save-direct': saveDirect(id); break;
     case 'delete-ledger':
       if (confirm('Delete this and everything in it?')) {
-        db.ledgers = db.ledgers.filter(x => x.id !== id);
+        kill(l);
+        expensesOf(l).forEach(kill);
+        settlementsOf(l).forEach(kill);
         save(); closeSheet(); go('/'); render();
       }
       break;
 
     case 'add-expense': expenseSheet(l, null); break;
-    case 'edit-expense': expenseSheet(l, l.expenses.find(x => x.id === eid)); break;
+    case 'edit-expense': expenseSheet(l, expensesOf(l).find(x => x.id === eid)); break;
     case 'save-expense': saveExpense(id, eid); break;
     case 'delete-expense':
       if (confirm('Delete this expense?')) {
-        l.expenses = l.expenses.filter(x => x.id !== eid);
+        const victim = l.expenses.find(x => x.id === eid);
+        if (victim) kill(victim);
         save(); closeSheet(); render();
       }
       break;
@@ -1230,14 +1356,27 @@ document.addEventListener('click', ev => {
         ? { from: el.dataset.from, to: el.dataset.to, amount: Number(el.dataset.amount), date: todayISO() }
         : null);
       break;
-    case 'edit-settlement': paymentSheet(l, null, (l.settlements || []).find(x => x.id === sid)); break;
+    case 'edit-settlement': paymentSheet(l, null, settlementsOf(l).find(x => x.id === sid)); break;
     case 'save-payment': savePayment(id, sid); break;
     case 'delete-payment':
       if (confirm('Delete this payment?')) {
-        l.settlements = (l.settlements || []).filter(x => x.id !== sid);
+        const victim = (l.settlements || []).find(x => x.id === sid);
+        if (victim) kill(victim);
         save(); closeSheet(); render();
       }
       break;
+
+    case 'share-sheet': shareSheet(l); break;
+    case 'start-sharing': startSharing(id); break;
+    case 'copy-code': copyJoin(el.dataset.code, el.dataset.mode); break;
+    case 'stop-sharing':
+      if (confirm('Stop syncing this on this phone? You keep everything you already have.')) {
+        window.SplitSync.stop(id); closeSheet(); render(); toast('Syncing stopped here');
+      }
+      break;
+    case 'join-prompt': joinSheet(''); break;
+    case 'do-join': doJoin(); break;
+    case 'claim-me': claimIdentity(id, el.dataset.pid); break;
 
     case 'share-summary': shareSummary(l); break;
     case 'export': exportBackup(); break;
@@ -1245,7 +1384,7 @@ document.addEventListener('click', ev => {
     case 'save-my-name': {
       const value = document.getElementById('my-name').value.trim();
       if (!value) return toast('Your name cannot be blank');
-      personById(db.me).name = value;
+      renamePerson(myId(), value);
       save(); render(); toast('Name saved');
       break;
     }
@@ -1276,6 +1415,7 @@ function directSheet(l) {
     </div>
     <div class="btn-stack">
       <button class="btn" data-action="save-direct" data-id="${l.id}">Save changes</button>
+      <button class="btn secondary" data-action="share-sheet" data-id="${l.id}">${sharingLabel(l)}</button>
       <button class="btn danger" data-action="delete-ledger" data-id="${l.id}">Delete this tab</button>
     </div>
     <p class="hint">Renaming them here renames them in your groups too.</p>`);
@@ -1285,12 +1425,274 @@ function saveDirect(id) {
   const l = ledgerById(id);
   const name = document.getElementById('d-name').value.trim();
   if (!name) return toast('Give them a name');
-  personById(otherIn(l)).name = name;
+  renamePerson(otherIn(l), name);
   l.currency = document.getElementById('d-cur').value;
+  stamp(l);
   save();
   closeSheet();
   render();
 }
+
+/* --------------------------------------------------------- sharing sheets */
+
+const syncOn = () => Boolean(window.SplitSync && window.SplitSync.configured());
+const sharingLabel = l => (db.sync[l.id] ? 'Sharing…' : 'Share with them…');
+
+function shareSheet(l) {
+  const sync = db.sync[l.id];
+
+  if (!syncOn()) {
+    openSheet(`
+      ${sheetHead('Share this')}
+      <div class="card"><div class="hint">
+        Syncing is not set up on this copy of the app yet. It needs a free
+        Supabase project — put its URL and anon key into <strong>config.js</strong>
+        and reload, and this button starts working. Until then everything
+        stays on this phone, which is the only way it can work without a
+        server in the middle.
+      </div></div>
+      <div class="btn-stack"><button class="btn secondary" data-close>Fair enough</button></div>`);
+    return;
+  }
+
+  if (!sync) {
+    openSheet(`
+      ${sheetHead('Share this')}
+      <div class="card"><div class="hint">
+        This makes a join code. Give it to ${esc(l.kind === 'direct' ? realName(otherIn(l)) : 'the others')}
+        and what either of you adds shows up on the other side within a few
+        seconds, as long as you both have signal.
+        <br><br>
+        Sharing uploads this ${esc(l.kind === 'direct' ? 'tab' : 'group')} and the
+        names in it. Everything else on your phone stays where it is. Anyone
+        who gets hold of the code can read and edit it, so treat it like a key.
+      </div></div>
+      <div class="btn-stack">
+        <button class="btn" data-action="start-sharing" data-id="${l.id}">Create a join code</button>
+      </div>`);
+    return;
+  }
+
+  const link = `${location.origin}${location.pathname}#/join/${sync.code}`;
+  const when = sync.at ? new Date(sync.at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : 'not yet';
+  const status = window.SplitSync.state;
+
+  openSheet(`
+    ${sheetHead('Shared')}
+    <div class="card">
+      <div class="field">
+        <label>Join code</label>
+        <div class="code">${esc(sync.code)}</div>
+      </div>
+      <div class="hint">Last synced ${esc(when)}${status.status === 'error' ? ` · <span class="bad">${esc(status.error)}</span>` : ''}</div>
+    </div>
+    <div class="btn-stack">
+      <button class="btn" data-action="copy-code" data-code="${esc(sync.code)}" data-mode="link">Send the link</button>
+      <button class="btn secondary" data-action="copy-code" data-code="${esc(sync.code)}" data-mode="code">Copy just the code</button>
+      <button class="btn danger" data-action="stop-sharing" data-id="${l.id}">Stop syncing on this phone</button>
+    </div>
+    <p class="hint">${esc(link)}</p>`);
+}
+
+async function startSharing(ledgerId) {
+  toast('Setting up…');
+  try {
+    await window.SplitSync.share(ledgerId);
+    render();
+    shareSheet(ledgerById(ledgerId));
+  } catch (err) {
+    toast(String(err.message || err).slice(0, 90));
+  }
+}
+
+async function copyJoin(code, mode) {
+  const link = `${location.origin}${location.pathname}#/join/${code}`;
+  const text = mode === 'link'
+    ? `Join my Split tab: ${link}\n\nOr enter the code ${code}.`
+    : code;
+  try {
+    if (mode === 'link' && navigator.share) { await navigator.share({ text }); return; }
+    await navigator.clipboard.writeText(text);
+    toast(mode === 'link' ? 'Link copied' : 'Code copied');
+  } catch (err) {
+    if (err && err.name === 'AbortError') return;
+    toast('Could not copy that');
+  }
+}
+
+function joinSheet(code) {
+  if (!syncOn()) {
+    openSheet(`
+      ${sheetHead('Join with a code')}
+      <div class="card"><div class="hint">
+        Syncing is not set up on this copy of the app. Add your Supabase URL
+        and anon key to <strong>config.js</strong> and reload.
+      </div></div>
+      <div class="btn-stack"><button class="btn secondary" data-close>Close</button></div>`);
+    return;
+  }
+  openSheet(`
+    ${sheetHead('Join with a code')}
+    <div class="card">
+      <div class="field">
+        <label for="j-code">Join code</label>
+        <input id="j-code" data-autofocus="yes" placeholder="ABCD-EFGH-JKMN"
+          value="${esc(window.SplitSync.tidyCode(code))}" autocomplete="off"
+          autocapitalize="characters" spellcheck="false">
+      </div>
+    </div>
+    <div class="btn-stack">
+      <button class="btn" data-action="do-join">Join</button>
+    </div>
+    <p class="hint">Whoever set it up can find the code under the ••• menu of the group or tab.</p>`);
+}
+
+async function doJoin() {
+  const code = document.getElementById('j-code').value;
+  toast('Looking it up…');
+  try {
+    const ledgerId = await window.SplitSync.join(code);
+    if (!ledgerId) return toast('No group found for that code');
+    const ledger = ledgerById(ledgerId);
+    save();
+    if (inLedger(ledger)) {
+      closeSheet(); go(`/l/${ledgerId}`); render(); toast('Joined');
+    } else {
+      claimSheet(ledger);
+    }
+  } catch (err) {
+    toast(String(err.message || err).slice(0, 90));
+  }
+}
+
+/* A shared ledger arrives with its own list of people, and the app cannot
+   guess which one the person holding this phone is. */
+function claimSheet(l) {
+  openSheet(`
+    ${sheetHead('Which one are you?')}
+    <div class="card">
+      ${l.members.map(pid => `
+        <button class="row" data-action="claim-me" data-id="${l.id}" data-pid="${pid}">
+          ${avatar(pid)}
+          <span class="grow"><span class="title">${esc(realName(pid))}</span></span>
+          <span class="chev">›</span>
+        </button>`).join('')}
+    </div>
+    <p class="hint">Picking yourself is what lets the app say who owes you what. It only affects this phone.</p>`);
+}
+
+function claimIdentity(ledgerId, personId) {
+  claimMe(personId);
+  save();
+  closeSheet();
+  go(`/l/${ledgerId}`);
+  render();
+  toast(`Joined as ${realName(personId)}`);
+}
+
+/* ------------------------------------------------------------------- sync */
+/* The store knows how to turn a ledger into flat records and how to fold
+   records back in; sync.js does the talking. A record wins on the later
+   timestamp, and on the higher device id when two land on the same
+   millisecond, so both phones independently reach the same answer. */
+
+const ledgerPayload = l => ({
+  id: l.id, kind: l.kind, name: l.name, currency: l.currency,
+  members: l.members, created: l.created,
+  deleted: !!l.deleted, updatedAt: l.updatedAt, device: l.device || '',
+});
+
+function recordsFor(ledger, since = 0) {
+  const out = [];
+  const add = (kind, source, payload) => {
+    const seq = source && source.localSeq;
+    if (!(seq > since)) return;
+    const { localSeq, ...clean } = payload;
+    out.push({
+      kind, id: clean.id, updatedAt: clean.updatedAt,
+      device: clean.device || '', localSeq: seq, payload: clean,
+    });
+  };
+  add('ledger', ledger, ledgerPayload(ledger));
+  ledger.members.forEach(pid => {
+    const person = personById(pid);
+    if (person) add('person', person, person);
+  });
+  ledger.expenses.forEach(e => add('expense', e, { ...e, ledgerId: ledger.id }));
+  (ledger.settlements || []).forEach(x => add('settlement', x, { ...x, ledgerId: ledger.id }));
+  return out;
+}
+
+const beats = (incoming, existing) => !existing
+  || incoming.updatedAt > existing.updatedAt
+  || (incoming.updatedAt === existing.updatedAt
+      && String(incoming.device || '') > String(existing.device || ''));
+
+function applyRecords(ledgerId, records) {
+  let changed = 0;
+
+  records.forEach(rec => {
+    const payload = rec.payload;
+    if (!payload || !payload.id) return;
+
+    if (rec.kind === 'person') {
+      const i = db.people.findIndex(p => p.id === payload.id);
+      if (!beats(payload, db.people[i])) return;
+      if (i >= 0) db.people[i] = payload; else db.people.push(payload);
+      changed++;
+      return;
+    }
+
+    if (rec.kind === 'ledger') {
+      const i = db.ledgers.findIndex(l => l.id === payload.id);
+      if (i < 0) {
+        db.ledgers.unshift({ ...payload, expenses: [], settlements: [] });
+        changed++;
+      } else if (beats(payload, db.ledgers[i])) {
+        /* The ledger record carries no children, so keep the ones we hold
+           and let their own records decide what happens to them. */
+        db.ledgers[i] = {
+          ...payload,
+          expenses: db.ledgers[i].expenses,
+          settlements: db.ledgers[i].settlements,
+        };
+        changed++;
+      }
+      return;
+    }
+
+    const l = db.ledgers.find(x => x.id === (payload.ledgerId || ledgerId));
+    if (!l) return;
+    if (rec.kind === 'settlement') l.settlements = l.settlements || [];
+    const list = rec.kind === 'expense' ? l.expenses : l.settlements;
+    const i = list.findIndex(x => x.id === payload.id);
+    if (!beats(payload, list[i])) return;
+    if (i >= 0) list[i] = payload; else list.push(payload);
+    changed++;
+  });
+
+  return changed;
+}
+
+/* A plain write with no sync callback, for the sync layer's own use —
+   save() would call straight back into it. */
+function saveQuiet() {
+  try { localStorage.setItem(KEY, JSON.stringify(db)); } catch { /* next save reports it */ }
+}
+
+window.SplitStore = {
+  get db() { return db; },
+  save, saveQuiet, render, toast, uid, stamp,
+  recordsFor, applyRecords,
+  ledgerById, liveLedgers, ledgerTitle, personById, realName,
+  claimMe, isMe, myId, inLedger,
+  syncOf: id => db.sync[id] || null,
+  setSync(id, patch) {
+    db.sync[id] = { ...(db.sync[id] || {}), ...patch };
+  },
+  clearSync(id) { delete db.sync[id]; },
+  sharedLedgers: () => liveLedgers().filter(l => db.sync[l.id]),
+};
 
 /* ------------------------------------------------------------------- boot */
 render();

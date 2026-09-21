@@ -1,10 +1,12 @@
 /* Offline shell. Bump CACHE when any of the listed files change. */
-const CACHE = 'split-v2';
+const CACHE = 'split-v3';
 const SHELL = [
   './',
   './index.html',
   './styles.css',
   './app.js',
+  './config.js',
+  './sync.js',
   './manifest.webmanifest',
   './icons/icon-180.png',
   './icons/icon-192.png',

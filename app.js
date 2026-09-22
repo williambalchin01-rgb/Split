@@ -722,7 +722,7 @@ function syncCard() {
   if (!syncOn()) {
     return `<div class="card"><div class="hint">
       <strong>Syncing is off.</strong> Everything lives on this phone only.
-      To share a group with someone, put a Supabase URL and anon key into
+      To share a group with someone, put a Supabase URL and publishable key into
       <strong>config.js</strong> and reload — see the README.
     </div></div>`;
   }
@@ -1446,7 +1446,7 @@ function shareSheet(l) {
       ${sheetHead('Share this')}
       <div class="card"><div class="hint">
         Syncing is not set up on this copy of the app yet. It needs a free
-        Supabase project — put its URL and anon key into <strong>config.js</strong>
+        Supabase project — put its URL and publishable key into <strong>config.js</strong>
         and reload, and this button starts working. Until then everything
         stays on this phone, which is the only way it can work without a
         server in the middle.
@@ -1526,7 +1526,7 @@ function joinSheet(code) {
       ${sheetHead('Join with a code')}
       <div class="card"><div class="hint">
         Syncing is not set up on this copy of the app. Add your Supabase URL
-        and anon key to <strong>config.js</strong> and reload.
+        and publishable key to <strong>config.js</strong> and reload.
       </div></div>
       <div class="btn-stack"><button class="btn secondary" data-close>Close</button></div>`);
     return;

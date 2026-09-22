@@ -26,7 +26,7 @@ create index if not exists split_records_code_seq on public.split_records (code,
 
 create sequence if not exists public.split_seq;
 
--- No direct access for anyone holding the anon key. The functions below are
+-- No direct access for anyone holding the publishable key. The functions below are
 -- the only way in, and they are security definer, so they reach the table
 -- on the caller's behalf after checking the code.
 alter table public.split_records enable row level security;

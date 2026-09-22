@@ -44,9 +44,16 @@ middle. This uses Supabase, on its free tier.
 
 1. Make a project at [supabase.com](https://supabase.com) (free tier is ample).
 2. Open **SQL Editor → New query**, paste in all of [`supabase.sql`](supabase.sql), run it.
-3. Open **Settings → API** and copy the **Project URL** and the **anon public** key.
+3. Open **Settings → API Keys** and copy the **Project URL** and the
+   **publishable** key — the one beginning `sb_publishable_`.
 4. Put both into [`config.js`](config.js) and redeploy. Bump `CACHE` in `sw.js` so
    installed copies pick the change up.
+
+   Never the **secret** key (`sb_secret_`). It bypasses every check in
+   `supabase.sql`, and `config.js` is served to every browser that opens the
+   app, so pasting it there would hand any visitor your whole database.
+   If one is ever exposed, revoke it on that same page — a project can hold
+   several and revoke them one at a time, so rotating breaks nothing.
 
 Then, in the app: open a group or tab, tap **•••**, **Share with them…**, and
 **Create a join code**. Send the link or read the code out. On the other phone,
@@ -64,9 +71,9 @@ made with no signal queue up and go out when it comes back.
 - **Only shared ledgers leave the phone.** A group you have not shared, and every
   one-to-one tab you keep to yourself, stay local.
 - **Names travel with a shared ledger**, because the other phone has to show them.
-- **The anon key in `config.js` is public by design.** It is not a password; on
-  its own it opens nothing, because the two functions in `supabase.sql` are the
-  only way to the data and both demand a join code.
+- **The publishable key in `config.js` is public by design.** It is not a
+  password; on its own it opens nothing, because the two functions in
+  `supabase.sql` are the only way to the data and both demand a join code.
 
 ### How a disagreement is settled
 
@@ -123,7 +130,7 @@ never shared exists only where you typed it.
 | `app.js` | All the logic: storage, splitting maths, views, actions |
 | `styles.css` | Dark and light themes, safe-area insets |
 | `sync.js` | Talking to Supabase: push, pull, merge, retry |
-| `config.js` | Your Supabase URL and anon key (empty = offline only) |
+| `config.js` | Your Supabase URL and publishable key (empty = offline only) |
 | `supabase.sql` | The server side: one table and the two functions that guard it |
 | `sw.js` | Service worker for offline use |
 | `manifest.webmanifest` | Home Screen name, icons, standalone display |

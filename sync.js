@@ -16,7 +16,12 @@
 
 const cfg = window.SPLIT_SYNC || {};
 const store = window.SplitStore;
-const configured = () => Boolean(cfg.url && cfg.anonKey);
+
+/* `anonKey` was the old name for this. A service worker can serve a
+   config.js from before the rename long after the app itself updates, and
+   reading only the new name would turn syncing off without saying so. */
+const apiKey = () => cfg.key || cfg.anonKey || '';
+const configured = () => Boolean(cfg.url && apiKey());
 
 const PULL_EVERY = 8000;   // while the app is open and in front
 const PUSH_DELAY = 900;    // let a burst of edits settle first
@@ -46,8 +51,8 @@ async function rpc(fn, body) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      apikey: cfg.anonKey,
-      Authorization: `Bearer ${cfg.anonKey}`,
+      apikey: apiKey(),
+      Authorization: `Bearer ${apiKey()}`,
     },
     body: JSON.stringify(body),
   });

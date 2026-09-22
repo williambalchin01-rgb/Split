@@ -1,5 +1,5 @@
 /* Offline shell. Bump CACHE when any of the listed files change. */
-const CACHE = 'split-v3';
+const CACHE = 'split-v4';
 const SHELL = [
   './',
   './index.html',
